@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+youtube_token.pkl
+client_secrets.json
+bot.log
+downloads/
