@@ -7,6 +7,8 @@ import os
 import logging
 import asyncio
 import tempfile
+import json
+import uuid
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -23,6 +25,42 @@ from telegram.constants import ParseMode
 
 from youtube_uploader import YouTubeUploader
 from config import BOT_TOKEN, AUTHORIZED_USER_ID, DOWNLOADS_DIR
+
+DRAFTS_FILE = "drafts.json"
+
+def get_drafts():
+    if not os.path.exists(DRAFTS_FILE):
+        return []
+    try:
+        with open(DRAFTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_local_draft(title, description, file_path):
+    drafts = get_drafts()
+    draft_id = str(uuid.uuid4())[:8]
+    drafts.append({
+        "id": draft_id,
+        "title": title,
+        "description": description,
+        "file_path": file_path
+    })
+    with open(DRAFTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(drafts, f, indent=4)
+    return draft_id
+
+def remove_draft(draft_id):
+    drafts = get_drafts()
+    new_drafts = [d for d in drafts if d["id"] != draft_id]
+    with open(DRAFTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(new_drafts, f, indent=4)
+
+def get_draft(draft_id):
+    for d in get_drafts():
+        if d["id"] == draft_id:
+            return d
+    return None
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -325,8 +363,11 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Upload Public", callback_data="confirm_upload_public"),
-            InlineKeyboardButton("📝 Save as Draft", callback_data="confirm_upload_private"),
+            InlineKeyboardButton("✅ Upload to YouTube (Public)", callback_data="upload_public"),
+            InlineKeyboardButton("🔒 Upload to YouTube (Private)", callback_data="upload_private"),
+        ],
+        [
+            InlineKeyboardButton("💾 Save to Bot Drafts", callback_data="save_draft_local"),
         ],
         [
             InlineKeyboardButton("❌ Cancel", callback_data="cancel_upload"),
@@ -363,11 +404,22 @@ async def confirm_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ConversationHandler.END
 
-    # Proceed with upload
     video_path = context.user_data.get("video_path")
     title = context.user_data.get("title")
     description = context.user_data.get("description", "")
-    privacy_status = "public" if query.data == "confirm_upload_public" else "private"
+
+    if query.data == "save_draft_local":
+        save_local_draft(title, description, video_path)
+        context.user_data.clear()
+        await query.edit_message_text(
+            "💾 *Saved to Bot Drafts!*\n\n"
+            "You can upload it later by using the /drafts command.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    # Proceed with upload
+    privacy_status = "public" if query.data == "upload_public" else "private"
 
     uploader: YouTubeUploader = context.bot_data["uploader"]
 
@@ -426,6 +478,87 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Drafts ────────────────────────────────────────────────────────────────────
+@authorized_only
+async def list_drafts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    drafts = get_drafts()
+    if not drafts:
+        await update.message.reply_text("📭 You don't have any saved drafts.")
+        return ConversationHandler.END
+
+    text = "📁 *Your Saved Drafts:*\n\n"
+    keyboard = []
+
+    for i, d in enumerate(drafts, 1):
+        text += f"{i}. *{d['title']}*\n"
+        keyboard.append([InlineKeyboardButton(f"⬆️ Upload: {d['title']}", callback_data=f"draft_upload_{d['id']}")])
+        keyboard.append([InlineKeyboardButton(f"❌ Delete: {d['title']}", callback_data=f"draft_delete_{d['id']}")])
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ConversationHandler.END
+
+async def handle_draft_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("draft_delete_"):
+        draft_id = data.replace("draft_delete_", "")
+        draft = get_draft(draft_id)
+        if draft:
+            if os.path.exists(draft["file_path"]):
+                os.remove(draft["file_path"])
+            remove_draft(draft_id)
+            await query.edit_message_text("🗑️ Draft deleted.")
+        else:
+            await query.edit_message_text("❌ Draft not found.")
+
+    elif data.startswith("draft_upload_"):
+        draft_id = data.replace("draft_upload_", "")
+        draft = get_draft(draft_id)
+        if not draft:
+            await query.edit_message_text("❌ Draft not found.")
+            return ConversationHandler.END
+
+        uploader: YouTubeUploader = context.bot_data["uploader"]
+        if not uploader.is_authenticated():
+            await query.edit_message_text("⚠️ *YouTube not connected.*\nUse /login first.", parse_mode=ParseMode.MARKDOWN)
+            return ConversationHandler.END
+
+        await query.edit_message_text(f"⬆️ *Uploading draft to YouTube (Public)…*\n\n📝 Title: {draft['title']}", parse_mode=ParseMode.MARKDOWN)
+
+        try:
+            video_id = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: uploader.upload_video(draft["file_path"], draft["title"], draft["description"], privacy_status="public"),
+            )
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            await query.edit_message_text(
+                "🎉 *Draft uploaded successfully!*\n\n"
+                f"📝 *Title:* `{draft['title']}`\n"
+                f"🔗 *URL:* {video_url}\n\n"
+                "Your video is now processing on YouTube.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+            if os.path.exists(draft["file_path"]):
+                os.remove(draft["file_path"])
+            remove_draft(draft_id)
+
+        except Exception as e:
+            logger.error(f"Draft upload error: {e}")
+            await query.edit_message_text(
+                f"❌ *Upload failed.*\n\nError: `{str(e)}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+    return ConversationHandler.END
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     logger.info("Starting YouTube Auto Poster Bot…")
@@ -463,7 +596,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_description),
             ],
             CONFIRM_UPLOAD: [
-                CallbackQueryHandler(confirm_upload, pattern="^(confirm_upload_public|confirm_upload_private|cancel_upload)$")
+                CallbackQueryHandler(confirm_upload, pattern="^(upload_public|upload_private|save_draft_local|cancel_upload)$")
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -477,6 +610,8 @@ def main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("logout", logout))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("drafts", list_drafts))
+    app.add_handler(CallbackQueryHandler(handle_draft_action, pattern="^draft_(upload|delete)_"))
     app.add_handler(upload_conv)
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
